@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "acp_gateway",
+  "project_id": "2e417909-93e4-4459-80a0-1cba9a229f5e"
+}

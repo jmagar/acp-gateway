@@ -1,0 +1,17 @@
+/target/
+data/
+.env
+*.env.local
+.firecrawl/
+.cache/
+docs/plans/
+docs/superpowers/
+docs/sessions/
+docs/reports
+.cache/
+claude-agent-acp
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
