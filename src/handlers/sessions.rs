@@ -13,7 +13,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::json;
-use std::{path::PathBuf, sync::Arc};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 pub async fn create(
@@ -30,8 +30,9 @@ pub async fn create(
         .map(|(index, config)| mcp_to_acp(config, index))
         .collect::<Result<Vec<_>, _>>()?;
 
+    let cwd = validate_cwd(&body.cwd)?;
     let response = handle
-        .new_session(PathBuf::from(&body.cwd), mcp_servers)
+        .new_session(cwd.clone(), mcp_servers)
         .await
         .map_err(AppError::Acp)?;
     let session_id = response.session_id.0.to_string();
@@ -40,7 +41,7 @@ pub async fn create(
     let meta = SessionMeta {
         session_id: session_id.clone(),
         agent: body.agent.clone(),
-        cwd: body.cwd.clone(),
+        cwd: cwd.to_string_lossy().into_owned(),
         mcp_servers: body.mcp_servers.clone(),
         status: SessionStatus::Active,
         created_at,
@@ -207,6 +208,44 @@ pub async fn list_agents() -> Json<serde_json::Value> {
         .collect();
     agents.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
     Json(json!(agents))
+}
+
+fn validate_cwd(cwd: &str) -> Result<std::path::PathBuf, AppError> {
+    let path = std::path::Path::new(cwd);
+
+    // Must be an absolute path
+    if !path.is_absolute() {
+        return Err(AppError::InvalidRequest(format!(
+            "cwd must be an absolute path, got: {}",
+            cwd
+        )));
+    }
+
+    // Canonicalize (resolves symlinks and .. components)
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        AppError::InvalidRequest(format!("cwd is not a valid directory: {}: {}", cwd, e))
+    })?;
+
+    // Must be a directory
+    if !canonical.is_dir() {
+        return Err(AppError::InvalidRequest(format!(
+            "cwd must be a directory, got: {}",
+            cwd
+        )));
+    }
+
+    // Optionally enforce ALLOWED_CWD_BASE prefix allowlist
+    if let Ok(allowed_base) = std::env::var("ALLOWED_CWD_BASE") {
+        let allowed = std::path::Path::new(&allowed_base);
+        if !canonical.starts_with(allowed) {
+            return Err(AppError::InvalidRequest(format!(
+                "cwd '{}' is outside the allowed base directory '{}'",
+                cwd, allowed_base
+            )));
+        }
+    }
+
+    Ok(canonical)
 }
 
 fn validate_mcp_url(url: &str) -> Result<(), AppError> {
@@ -380,6 +419,29 @@ mod stdio_tests {
     fn test_validate_stdio_command_blocks_shell_substitution() {
         assert!(validate_stdio_command("${PATH}").is_err());
         assert!(validate_stdio_command("$(whoami)").is_err());
+    }
+}
+
+#[cfg(test)]
+mod cwd_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_cwd_requires_absolute_path() {
+        assert!(validate_cwd("relative/path").is_err());
+        assert!(validate_cwd("./relative").is_err());
+        assert!(validate_cwd("../traversal").is_err());
+    }
+
+    #[test]
+    fn test_validate_cwd_accepts_valid_absolute_dir() {
+        // /tmp always exists and is a directory
+        assert!(validate_cwd("/tmp").is_ok());
+    }
+
+    #[test]
+    fn test_validate_cwd_rejects_nonexistent_path() {
+        assert!(validate_cwd("/tmp/this-path-should-not-exist-12345678").is_err());
     }
 }
 
