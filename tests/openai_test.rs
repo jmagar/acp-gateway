@@ -1,10 +1,12 @@
 use acp_gateway::{
     app::build_app,
     manager::{AppState, SessionManager},
+    agent::known_agents,
+    pool::AgentPool,
 };
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tempfile::tempdir;
 
 async fn make_server() -> TestServer {
@@ -14,7 +16,14 @@ async fn make_server() -> TestServer {
             .await
             .unwrap(),
     );
-    TestServer::new(build_app(AppState { sessions: manager }))
+    let pools: HashMap<String, AgentPool> = known_agents()
+        .into_iter()
+        .map(|(name, def)| (name, AgentPool::new(def)))
+        .collect();
+    TestServer::new(build_app(AppState {
+        sessions: manager,
+        pools: Arc::new(pools),
+    }))
 }
 
 #[tokio::test]

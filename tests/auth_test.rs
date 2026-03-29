@@ -4,7 +4,7 @@ use acp_gateway::{
 };
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tempfile::tempdir;
 
 async fn make_server() -> (TestServer, tempfile::TempDir) {
@@ -14,6 +14,7 @@ async fn make_server() -> (TestServer, tempfile::TempDir) {
         .unwrap();
     let app = build_app(AppState {
         sessions: Arc::new(manager),
+        pools: Arc::new(HashMap::new()),
     });
     // TestServer::new returns TestServer directly (not Result) in this version
     (TestServer::new(app), dir)

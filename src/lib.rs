@@ -6,5 +6,6 @@ pub mod error;
 pub mod events;
 pub mod handlers;
 pub mod manager;
+pub mod pool;
 pub mod registry;
 pub mod types;

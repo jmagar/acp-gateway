@@ -1,8 +1,9 @@
 use crate::{
-    agent::{connect_agent, get_agent, known_agents, AgentHandle},
+    agent::{known_agents, AgentHandle},
     error::AppError,
     events::extract_text_from_notification,
     manager::AppState,
+    pool::AgentPool,
     types::{
         OpenAiChatRequest, OpenAiChatResponse, OpenAiChoice, OpenAiDelta, OpenAiMessageOut,
         OpenAiStreamChunk, OpenAiStreamChoice,
@@ -19,7 +20,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::json;
-use std::{convert::Infallible, path::PathBuf};
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
 pub async fn models() -> Json<serde_json::Value> {
@@ -39,11 +40,9 @@ pub async fn models() -> Json<serde_json::Value> {
 }
 
 pub async fn chat_completions(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(body): Json<OpenAiChatRequest>,
 ) -> Result<Response, AppError> {
-    let agent_def = get_agent(&body.model)
-        .ok_or_else(|| AppError::AgentNotFound(body.model.clone()))?;
     let user_message = body
         .messages
         .iter()
@@ -52,7 +51,13 @@ pub async fn chat_completions(
         .map(|message| message.content.clone())
         .unwrap_or_default();
 
-    let handle = connect_agent(&agent_def).await.map_err(AppError::Acp)?;
+    // Acquire pooled handle (reuses existing subprocess or spawns new one)
+    let pool = state
+        .pools
+        .get(&body.model)
+        .ok_or_else(|| AppError::AgentNotFound(body.model.clone()))?;
+    let handle = pool.acquire().await.map_err(AppError::Acp)?;
+
     let session = handle
         .new_session(default_cwd(), vec![])
         .await
@@ -61,9 +66,27 @@ pub async fn chat_completions(
     let created = Utc::now().timestamp();
 
     if body.stream {
-        streaming_response(handle, session.session_id, user_message, request_id, created, body.model).await
+        streaming_response(
+            handle,
+            session.session_id,
+            user_message,
+            request_id,
+            created,
+            body.model,
+            Arc::clone(&state.pools),
+        )
+        .await
     } else {
-        non_streaming_response(handle, session.session_id, user_message, request_id, created, body.model).await
+        non_streaming_response(
+            handle,
+            session.session_id,
+            user_message,
+            request_id,
+            created,
+            body.model,
+            Arc::clone(&state.pools),
+        )
+        .await
     }
 }
 
@@ -74,6 +97,7 @@ async fn non_streaming_response(
     request_id: String,
     created: i64,
     model: String,
+    pools: Arc<HashMap<String, AgentPool>>,
 ) -> Result<Response, AppError> {
     let mut updates = handle.subscribe_updates();
     handle
@@ -88,7 +112,12 @@ async fn non_streaming_response(
         }
     }
 
-    let _ = handle.close().await;
+    // Return to pool instead of closing (subprocess stays alive for the next request)
+    if let Some(pool) = pools.get(&model) {
+        pool.release_capped(handle, 4).await;
+    } else {
+        let _ = handle.close().await;
+    }
 
     Ok(Json(OpenAiChatResponse {
         id: request_id,
@@ -114,6 +143,7 @@ async fn streaming_response(
     request_id: String,
     created: i64,
     model: String,
+    pools: Arc<HashMap<String, AgentPool>>,
 ) -> Result<Response, AppError> {
     let mut updates = handle.subscribe_updates();
     let prompt_handle = handle.clone();
@@ -174,7 +204,13 @@ async fn streaming_response(
                     };
                     yield Ok(Event::default().data(serde_json::to_string(&done_chunk).unwrap()));
                     yield Ok(Event::default().data("[DONE]"));
-                    let _ = handle.close().await;
+
+                    // Return to pool instead of closing (subprocess stays alive)
+                    if let Some(pool) = pools.get(&model) {
+                        pool.release_capped(handle, 4).await;
+                    } else {
+                        let _ = handle.close().await;
+                    }
                     break;
                 }
                 update = updates.recv() => {

@@ -1,10 +1,11 @@
 use crate::{
     agent::AgentHandle,
+    pool::AgentPool,
     registry::SessionRegistry,
     types::{SessionMeta, StoredEvent},
 };
 use dashmap::DashMap;
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, RwLock};
 
 pub const BROADCAST_CAPACITY: usize = 1024;
@@ -126,4 +127,5 @@ impl SessionManager {
 #[derive(Clone)]
 pub struct AppState {
     pub sessions: Arc<SessionManager>,
+    pub pools: Arc<HashMap<String, AgentPool>>,
 }

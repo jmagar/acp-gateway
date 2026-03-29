@@ -6,7 +6,7 @@ use acp_gateway::{
 use axum::http::StatusCode;
 use axum_test::TestServer;
 use chrono::Utc;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tempfile::tempdir;
 
 async fn make_test_server_with_session(session_id: &str, event_count: usize) -> TestServer {
@@ -38,7 +38,10 @@ async fn make_test_server_with_session(session_id: &str, event_count: usize) -> 
             .await;
     }
 
-    TestServer::new(build_app(AppState { sessions: manager }))
+    TestServer::new(build_app(AppState {
+        sessions: manager,
+        pools: Arc::new(HashMap::new()),
+    }))
 }
 
 #[tokio::test]
@@ -87,7 +90,10 @@ async fn test_stream_endpoint_returns_410_for_dead_session() {
     };
     manager.registry.append(&meta).await.unwrap();
 
-    let server = TestServer::new(build_app(AppState { sessions: manager }));
+    let server = TestServer::new(build_app(AppState {
+        sessions: manager,
+        pools: Arc::new(HashMap::new()),
+    }));
     let response = server.get("/api/sessions/dead-001/stream").await;
     assert_eq!(response.status_code(), StatusCode::GONE);
 }
@@ -103,6 +109,7 @@ async fn test_full_session_lifecycle_with_real_agent() {
     );
     let server = TestServer::new(build_app(AppState {
         sessions: Arc::clone(&manager),
+        pools: Arc::new(HashMap::new()),
     }));
 
     let create_response = server

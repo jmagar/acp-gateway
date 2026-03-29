@@ -4,7 +4,7 @@ use acp_gateway::{
 };
 use axum::http::StatusCode;
 use axum_test::TestServer;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -15,6 +15,7 @@ async fn test_health_check_returns_ok() {
         .unwrap();
     let app = build_app(AppState {
         sessions: Arc::new(manager),
+        pools: Arc::new(HashMap::new()),
     });
     let server = TestServer::new(app);
 
