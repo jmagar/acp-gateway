@@ -1,10 +1,17 @@
 use crate::{auth::require_api_key, handlers, manager::AppState};
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{delete, get, post},
     Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use std::time::Duration;
+use tower::ServiceBuilder;
+use tower_http::{
+    cors::{Any, CorsLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 
 pub fn build_app(state: AppState) -> Router {
     let cors = CorsLayer::new()
@@ -29,5 +36,14 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(handlers::health::health))
         .merge(protected)
         .with_state(state)
-        .layer(cors)
+        .layer(
+            ServiceBuilder::new()
+                .layer(TraceLayer::new_for_http())
+                .layer(TimeoutLayer::with_status_code(
+                    axum::http::StatusCode::REQUEST_TIMEOUT,
+                    Duration::from_secs(30),
+                ))
+                .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
+                .layer(cors),
+        )
 }
