@@ -274,6 +274,51 @@ fn is_private_ip(addr: &std::net::IpAddr) -> bool {
     }
 }
 
+fn validate_stdio_command(command: &str) -> Result<(), AppError> {
+    // Reject empty commands.
+    if command.trim().is_empty() {
+        return Err(AppError::InvalidRequest(
+            "MCP stdio command must not be empty".to_string(),
+        ));
+    }
+
+    // Reject shell metacharacters that indicate injection attempts.
+    let shell_metacharacters = [';', '|', '&', '`'];
+    for ch in shell_metacharacters {
+        if command.contains(ch) {
+            return Err(AppError::InvalidRequest(format!(
+                "MCP stdio command contains forbidden shell metacharacter: {ch}"
+            )));
+        }
+    }
+    if command.contains("$(") || command.contains("${") {
+        return Err(AppError::InvalidRequest(
+            "MCP stdio command contains forbidden shell substitution".to_string(),
+        ));
+    }
+
+    // Reject known shell binaries and common escape tools by basename.
+    // Using a blocklist because a full allowlist would require enumerating all
+    // valid MCP server binary names, which is not feasible.
+    let command_basename = std::path::Path::new(command)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(command);
+    let blocked_commands = [
+        "sh", "bash", "zsh", "fish", "csh", "tcsh", "dash", "ksh",
+        "python", "python2", "python3", "perl", "ruby", "node", "nodejs",
+        "nc", "netcat", "ncat", "socat",
+    ];
+    if blocked_commands.contains(&command_basename) {
+        return Err(AppError::InvalidRequest(format!(
+            "MCP stdio command '{}' is not permitted",
+            command_basename
+        )));
+    }
+
+    Ok(())
+}
+
 fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppError> {
     match config {
         McpServerConfig::Sse { url } => {
@@ -290,9 +335,51 @@ fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppEr
                 url.clone(),
             )))
         }
-        McpServerConfig::Stdio { command, args } => Ok(McpServer::Stdio(
-            McpServerStdio::new(format!("mcp-stdio-{index}"), command.clone()).args(args.clone()),
-        )),
+        McpServerConfig::Stdio { command, args } => {
+            validate_stdio_command(command)?;
+            Ok(McpServer::Stdio(
+                McpServerStdio::new(format!("mcp-stdio-{index}"), command.clone()).args(args.clone()),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod stdio_tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_stdio_command_blocks_shells() {
+        assert!(validate_stdio_command("bash").is_err());
+        assert!(validate_stdio_command("/bin/sh").is_err());
+        assert!(validate_stdio_command("/usr/bin/python3").is_err());
+        assert!(validate_stdio_command("nc").is_err());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_blocks_metacharacters() {
+        assert!(validate_stdio_command("echo; rm -rf /").is_err());
+        assert!(validate_stdio_command("cmd|bash").is_err());
+        assert!(validate_stdio_command("$(evil)").is_err());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_permits_mcp_servers() {
+        assert!(validate_stdio_command("npx").is_ok());
+        assert!(validate_stdio_command("/usr/local/bin/my-mcp-server").is_ok());
+        assert!(validate_stdio_command("./mcp-server").is_ok());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_rejects_empty() {
+        assert!(validate_stdio_command("").is_err());
+        assert!(validate_stdio_command("   ").is_err());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_blocks_shell_substitution() {
+        assert!(validate_stdio_command("${PATH}").is_err());
+        assert!(validate_stdio_command("$(whoami)").is_err());
     }
 }
 
