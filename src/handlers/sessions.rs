@@ -541,6 +541,11 @@ fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppEr
 mod stdio_tests {
     use super::*;
 
+    // Serialise tests that mutate ALLOWED_STDIO_COMMANDS to prevent races
+    // when cargo test runs them in parallel.
+    static ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     #[test]
     fn test_validate_stdio_command_blocks_shells() {
         // These are no longer in a blocklist but are not in the allowlist either,
@@ -586,6 +591,7 @@ mod stdio_tests {
 
     #[test]
     fn test_validate_stdio_command_env_var_extends_allowlist() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // Basename match via env var.
         std::env::set_var("ALLOWED_STDIO_COMMANDS", "my-mcp-server,another-tool");
         assert!(validate_stdio_command("my-mcp-server").is_ok());
@@ -598,6 +604,7 @@ mod stdio_tests {
 
     #[test]
     fn test_validate_stdio_command_env_var_full_path_match() {
+        let _guard = ENV_MUTEX.lock().unwrap();
         // Full path can also be specified directly in env var.
         std::env::set_var("ALLOWED_STDIO_COMMANDS", "/opt/custom/mcp-server");
         assert!(validate_stdio_command("/opt/custom/mcp-server").is_ok());
