@@ -72,7 +72,7 @@ pub struct StreamQuery {
     pub from: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEvent {
     pub index: usize,
     pub event_type: String,
