@@ -196,7 +196,13 @@ async fn streaming_response(
                 finish_reason: None,
             }],
         };
-        yield Ok::<Event, Infallible>(Event::default().data(serde_json::to_string(&role_chunk).unwrap()));
+        match serde_json::to_string(&role_chunk) {
+            Ok(data) => yield Ok::<Event, Infallible>(Event::default().data(data)),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to serialize SSE chunk");
+                return;
+            }
+        }
 
         let mut prompt_task = tokio::spawn(async move {
             prompt_handle.prompt_text(session_id, user_message).await
@@ -219,7 +225,13 @@ async fn streaming_response(
                                         finish_reason: None,
                                     }],
                                 };
-                                yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
+                                match serde_json::to_string(&chunk) {
+                                    Ok(data) => yield Ok(Event::default().data(data)),
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "failed to serialize SSE chunk");
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -235,7 +247,13 @@ async fn streaming_response(
                             finish_reason: Some("stop".to_string()),
                         }],
                     };
-                    yield Ok(Event::default().data(serde_json::to_string(&done_chunk).unwrap()));
+                    match serde_json::to_string(&done_chunk) {
+                        Ok(data) => yield Ok(Event::default().data(data)),
+                        Err(e) => {
+                            tracing::error!(error = %e, "failed to serialize SSE chunk");
+                            break;
+                        }
+                    }
                     yield Ok(Event::default().data("[DONE]"));
 
                     // Return to pool instead of closing (subprocess stays alive)
@@ -261,7 +279,13 @@ async fn streaming_response(
                                         finish_reason: None,
                                     }],
                                 };
-                                yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
+                                match serde_json::to_string(&chunk) {
+                                    Ok(data) => yield Ok(Event::default().data(data)),
+                                    Err(e) => {
+                                        tracing::error!(error = %e, "failed to serialize SSE chunk");
+                                        break;
+                                    }
+                                }
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
