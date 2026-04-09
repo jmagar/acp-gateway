@@ -18,7 +18,7 @@ pub struct AgentDef {
 
 #[derive(Clone)]
 pub struct AgentHandle {
-    command_tx: mpsc::UnboundedSender<AgentCommand>,
+    command_tx: mpsc::Sender<AgentCommand>,
     updates_tx: broadcast::Sender<SessionNotification>,
 }
 
@@ -61,6 +61,7 @@ impl AgentHandle {
                 mcp_servers,
                 resp: resp_tx,
             })
+            .await
             .map_err(|_| anyhow!("agent worker is no longer running"))?;
         resp_rx.await.context("agent worker dropped new_session response")?
     }
@@ -79,6 +80,7 @@ impl AgentHandle {
                 mcp_servers,
                 resp: resp_tx,
             })
+            .await
             .map_err(|_| anyhow!("agent worker is no longer running"))?;
         resp_rx.await.context("agent worker dropped load_session response")?
     }
@@ -91,6 +93,7 @@ impl AgentHandle {
                 prompt,
                 resp: resp_tx,
             })
+            .await
             .map_err(|_| anyhow!("agent worker is no longer running"))?;
         resp_rx.await.context("agent worker dropped prompt response")?
     }
@@ -107,6 +110,7 @@ impl AgentHandle {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.command_tx
             .send(AgentCommand::Close { resp: resp_tx })
+            .await
             .map_err(|_| anyhow!("agent worker is no longer running"))?;
         resp_rx.await.context("agent worker dropped close response")?
     }
@@ -131,7 +135,7 @@ pub fn get_agent(name: &str) -> Option<AgentDef> {
 }
 
 pub async fn connect_agent(def: &AgentDef) -> Result<AgentHandle> {
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    let (command_tx, mut command_rx) = mpsc::channel(32);
     let (updates_tx, _) = broadcast::channel(1024);
     let (ready_tx, ready_rx) = oneshot::channel();
     let def = def.clone();
