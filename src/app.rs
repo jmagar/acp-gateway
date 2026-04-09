@@ -8,16 +8,42 @@ use axum::{
 use std::time::Duration;
 use tower::ServiceBuilder;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
 
+fn build_cors() -> CorsLayer {
+    match std::env::var("ALLOWED_ORIGINS") {
+        Ok(origins) if !origins.is_empty() => {
+            let headers: Vec<axum::http::HeaderValue> = origins
+                .split(',')
+                .map(|o| o.trim())
+                .filter(|o| !o.is_empty())
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(headers)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::DELETE,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                ])
+        }
+        _ => {
+            // No ALLOWED_ORIGINS set — deny all cross-origin requests
+            CorsLayer::new()
+        }
+    }
+}
+
 pub fn build_app(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    let cors = build_cors();
 
     // Protected routes — require a valid Bearer token when API_KEY env var is set
     let protected = Router::new()
