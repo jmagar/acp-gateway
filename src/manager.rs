@@ -25,6 +25,7 @@ pub struct ActiveSession {
     pub events: Arc<RwLock<EventLog>>,
     pub tx: broadcast::Sender<(usize, StoredEvent)>,
     pub agent: Option<AgentHandle>,
+    pub event_writer_tx: Option<tokio::sync::mpsc::Sender<String>>,
 }
 
 impl ActiveSession {
@@ -41,6 +42,7 @@ impl ActiveSession {
             })),
             tx,
             agent,
+            event_writer_tx: None,
         }
     }
 }
@@ -74,7 +76,40 @@ impl SessionManager {
             .join("events.jsonl")
     }
 
-    pub fn insert(&self, session_id: String, session: ActiveSession) {
+    pub fn insert(&self, session_id: String, mut session: ActiveSession) {
+        let events_path = self.session_events_path(&session_id);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(256);
+        session.event_writer_tx = Some(tx);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Create parent directory once, keep file open for the session lifetime
+            let parent = events_path.parent().map(|p| p.to_path_buf());
+            if let Some(parent) = parent {
+                if let Err(e) = tokio::fs::create_dir_all(&parent).await {
+                    tracing::error!(error = %e, path = %parent.display(), "failed to create event log dir");
+                    return;
+                }
+            }
+            let mut file = match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&events_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(error = %e, path = %events_path.display(), "failed to open event log");
+                    return;
+                }
+            };
+            while let Some(line) = rx.recv().await {
+                if let Err(e) = file.write_all(line.as_bytes()).await {
+                    tracing::error!(error = %e, "event log write failed");
+                    // Continue draining to avoid blocking push_event callers
+                }
+            }
+            // rx closed (ActiveSession dropped) → writer task exits naturally
+        });
         self.active.insert(session_id, session);
     }
 
@@ -98,10 +133,10 @@ impl SessionManager {
         data: serde_json::Value,
     ) -> Option<usize> {
         let maybe_session = self.active.get(session_id).map(|entry| {
-            (Arc::clone(&entry.events), entry.tx.clone())
+            (Arc::clone(&entry.events), entry.tx.clone(), entry.event_writer_tx.clone())
         });
 
-        if let Some((events, tx)) = maybe_session {
+        if let Some((events, tx, maybe_writer_tx)) = maybe_session {
             let mut guard = events.write().await;
             let index = guard.next_index; // monotonic: never resets after eviction
             guard.next_index += 1;
@@ -116,25 +151,14 @@ impl SessionManager {
 
             let _ = tx.send((index, event.clone()));
 
-            // Persist to disk fire-and-forget (bead .57)
-            let events_path = self.session_events_path(session_id);
-            let event_json = serde_json::to_string(&event).unwrap_or_default();
-            tokio::spawn(async move {
-                use tokio::io::AsyncWriteExt;
-                if let Some(parent) = events_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
+            // Send to the per-session writer task (non-blocking; drops line if channel full)
+            if let Some(ref writer_tx) = maybe_writer_tx {
+                let event_json = serde_json::to_string(&event).unwrap_or_default();
+                let line = format!("{event_json}\n");
+                if let Err(e) = writer_tx.try_send(line) {
+                    tracing::warn!(error = %e, "event log channel full or closed; event not persisted");
                 }
-                if let Ok(mut file) = tokio::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&events_path)
-                    .await
-                {
-                    let _ = file
-                        .write_all(format!("{event_json}\n").as_bytes())
-                        .await;
-                }
-            });
+            }
 
             Some(index)
         } else {
