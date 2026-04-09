@@ -37,6 +37,7 @@ anyhow               = "1"
 futures              = "0.3"
 async-stream         = "0.3"
 subtle               = "2"
+url                  = "2"
 
 [dev-dependencies]
 axum-test = "19"

