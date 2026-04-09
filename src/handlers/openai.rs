@@ -100,15 +100,48 @@ async fn non_streaming_response(
     pools: Arc<HashMap<String, AgentPool>>,
 ) -> Result<Response, AppError> {
     let mut updates = handle.subscribe_updates();
-    handle
-        .prompt_text(session_id, user_message)
-        .await
-        .map_err(AppError::Acp)?;
+    let prompt_handle = handle.clone();
+
+    let mut prompt_task = tokio::spawn(async move {
+        prompt_handle.prompt_text(session_id, user_message).await
+    });
 
     let mut content = String::new();
-    while let Ok(notification) = updates.try_recv() {
-        if let Some(text) = extract_text_from_notification(&notification) {
-            content.push_str(&text);
+    let mut prompt_done = false;
+
+    loop {
+        tokio::select! {
+            result = &mut prompt_task, if !prompt_done => {
+                prompt_done = true;
+                if let Err(e) = result.map_err(|e| AppError::Acp(e.into())).and_then(|r| r.map_err(AppError::Acp)) {
+                    if let Some(pool) = pools.get(&model) {
+                        pool.release_capped(handle, 4).await;
+                    } else {
+                        let _ = handle.close().await;
+                    }
+                    return Err(e);
+                }
+            }
+            update = updates.recv() => {
+                match update {
+                    Ok(notification) => {
+                        if let Some(text) = extract_text_from_notification(&notification) {
+                            content.push_str(&text);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        // Once prompt is done, drain remaining buffered updates then stop
+        if prompt_done {
+            while let Ok(notification) = updates.try_recv() {
+                if let Some(text) = extract_text_from_notification(&notification) {
+                    content.push_str(&text);
+                }
+            }
+            break;
         }
     }
 
@@ -234,6 +267,11 @@ async fn streaming_response(
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             yield Ok(Event::default().data("[DONE]"));
+                            if let Some(pool) = pools.get(&model) {
+                                pool.release_capped(handle, 4).await;
+                            } else {
+                                let _ = handle.close().await;
+                            }
                             break;
                         }
                     }
