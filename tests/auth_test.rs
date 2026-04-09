@@ -15,6 +15,7 @@ async fn make_server() -> (TestServer, tempfile::TempDir) {
     let app = build_app(AppState {
         sessions: Arc::new(manager),
         pools: Arc::new(HashMap::new()),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     });
     // TestServer::new returns TestServer directly (not Result) in this version
     (TestServer::new(app), dir)

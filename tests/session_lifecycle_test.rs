@@ -41,6 +41,7 @@ async fn make_test_server_with_session(session_id: &str, event_count: usize) -> 
     TestServer::new(build_app(AppState {
         sessions: manager,
         pools: Arc::new(HashMap::new()),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     }))
 }
 
@@ -93,6 +94,7 @@ async fn test_stream_endpoint_returns_410_for_dead_session() {
     let server = TestServer::new(build_app(AppState {
         sessions: manager,
         pools: Arc::new(HashMap::new()),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     }));
     let response = server.get("/api/sessions/dead-001/stream").await;
     assert_eq!(response.status_code(), StatusCode::GONE);
@@ -110,6 +112,7 @@ async fn test_full_session_lifecycle_with_real_agent() {
     let server = TestServer::new(build_app(AppState {
         sessions: Arc::clone(&manager),
         pools: Arc::new(HashMap::new()),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     }));
 
     let create_response = server

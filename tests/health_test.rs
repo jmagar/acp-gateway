@@ -16,6 +16,7 @@ async fn test_health_check_returns_ok() {
     let app = build_app(AppState {
         sessions: Arc::new(manager),
         pools: Arc::new(HashMap::new()),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     });
     let server = TestServer::new(app);
 

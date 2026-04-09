@@ -23,6 +23,7 @@ async fn make_server() -> TestServer {
     TestServer::new(build_app(AppState {
         sessions: manager,
         pools: Arc::new(pools),
+        default_cwd: std::path::PathBuf::from("/tmp"),
     }))
 }
 
