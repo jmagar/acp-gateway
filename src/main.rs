@@ -69,15 +69,25 @@ async fn main() {
                 .expect("failed to listen for ctrl_c");
             tracing::info!("shutdown signal received; closing agent connections");
 
-            // Close all active agent handles
-            for entry in sessions_for_shutdown.active.iter() {
-                if let Some(agent) = entry.value().agent.as_ref() {
+            // Collect all session handles FIRST (drops DashMap iter guard immediately)
+            // so we never .await while holding a DashMap shard read lock (deadlock risk).
+            let sessions_snapshot: Vec<(String, Option<acp_gateway::agent::AgentHandle>)> =
+                sessions_for_shutdown
+                    .active
+                    .iter()
+                    .map(|e| (e.key().clone(), e.value().agent.clone()))
+                    .collect();
+            // DashMap lock is released here
+
+            // Now await outside the lock
+            for (session_id, agent) in sessions_snapshot {
+                if let Some(agent) = agent {
                     let _ = agent.close().await;
                 }
                 // Mark as resumable so they can be resumed after restart
                 let _ = sessions_for_shutdown
                     .registry
-                    .update_status(entry.key(), acp_gateway::types::SessionStatus::Resumable)
+                    .update_status(&session_id, acp_gateway::types::SessionStatus::Resumable)
                     .await;
             }
 
