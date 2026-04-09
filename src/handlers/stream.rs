@@ -22,14 +22,20 @@ pub async fn stream(
         return Err(AppError::SessionNotFound(session_id));
     }
 
-    let buffered = state
-        .sessions
-        .get_events(&session_id, query.from, usize::MAX)
-        .await;
+    // FIX (.54/.19): subscribe FIRST to avoid missing events between snapshot and subscribe
     let rx = state
         .sessions
         .subscribe(&session_id)
         .ok_or_else(|| AppError::SessionDead(session_id.clone()))?;
+
+    // FIX (.20): cap replay at 500 events instead of usize::MAX
+    let buffered = state
+        .sessions
+        .get_events(&session_id, query.from, 500)
+        .await;
+
+    // Track the highest index we replayed so live stream can filter duplicates
+    let last_replayed = buffered.last().map(|e| e.index);
 
     let replay = stream::iter(buffered.into_iter().map(|event| {
         Ok::<Event, Infallible>(
@@ -40,14 +46,20 @@ pub async fn stream(
         )
     }));
 
-    let live = BroadcastStream::new(rx).filter_map(|result| async move {
-        result.ok().map(|(_index, event)| {
-            Ok::<Event, Infallible>(
+    // FIX (.54/.19): filter live events to only those not already covered by snapshot replay
+    let live = BroadcastStream::new(rx).filter_map(move |result| async move {
+        result.ok().and_then(|(_index, event)| {
+            if let Some(last) = last_replayed {
+                if event.index <= last {
+                    return None;
+                }
+            }
+            Some(Ok::<Event, Infallible>(
                 Event::default()
                     .id(event.index.to_string())
                     .event(event.event_type)
                     .data(serde_json::to_string(&event.data).unwrap_or_default()),
-            )
+            ))
         })
     });
 
