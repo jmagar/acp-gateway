@@ -45,31 +45,38 @@ fn build_cors() -> CorsLayer {
 pub fn build_app(state: AppState) -> Router {
     let cors = build_cors();
 
-    // Protected routes — require a valid Bearer token when API_KEY env var is set
-    let protected = Router::new()
+    // Long-lived routes — SSE streams and LLM completions that can run for
+    // minutes to hours; exempt from the 30s timeout to avoid premature 408s.
+    let long_lived = Router::new()
+        .route("/api/sessions/{id}/stream", get(handlers::stream::stream))
+        .route("/api/sessions/{id}/prompt", post(handlers::sessions::send_prompt))
+        .route("/v1/chat/completions", post(handlers::openai::chat_completions))
+        .route_layer(middleware::from_fn(require_api_key));
+
+    // Short-lived routes — management/CRUD endpoints expected to complete
+    // within seconds; enforce a 30s hard timeout.
+    let short_lived = Router::new()
         .route("/api/sessions", post(handlers::sessions::create).get(handlers::sessions::list))
         .route("/api/sessions/{id}", delete(handlers::sessions::delete_session))
-        .route("/api/sessions/{id}/prompt", post(handlers::sessions::send_prompt))
         .route("/api/sessions/{id}/events", get(handlers::sessions::events))
-        .route("/api/sessions/{id}/stream", get(handlers::stream::stream))
         .route("/api/sessions/{id}/resume", post(handlers::sessions::resume))
         .route("/api/sessions/{id}/cancel", post(handlers::sessions::cancel_session))
         .route("/api/agents", get(handlers::sessions::list_agents))
         .route("/v1/models", get(handlers::openai::models))
-        .route("/v1/chat/completions", post(handlers::openai::chat_completions))
-        .route_layer(middleware::from_fn(require_api_key));
+        .route_layer(middleware::from_fn(require_api_key))
+        .layer(TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(30),
+        ));
 
     Router::new()
         .route("/health", get(handlers::health::health))
-        .merge(protected)
+        .merge(long_lived)
+        .merge(short_lived)
         .with_state(state)
         .layer(
             ServiceBuilder::new()
                 .layer(TraceLayer::new_for_http())
-                .layer(TimeoutLayer::with_status_code(
-                    axum::http::StatusCode::REQUEST_TIMEOUT,
-                    Duration::from_secs(30),
-                ))
                 .layer(DefaultBodyLimit::max(1024 * 1024)) // 1 MiB
                 .layer(cors),
         )

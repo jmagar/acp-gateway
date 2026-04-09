@@ -234,10 +234,16 @@ pub async fn resume(
     active_meta.status = SessionStatus::Active;
     let active_session = ActiveSession::new(active_meta, tx, Some(handle));
 
-    // Populate events from disk
+    // Populate events from disk, restoring the monotonic counter (bead .105)
     if !prior_events.is_empty() {
         let mut events_guard = active_session.events.write().await;
-        *events_guard = prior_events;
+        let next_index = prior_events
+            .iter()
+            .map(|e| e.index + 1)
+            .max()
+            .unwrap_or(0);
+        events_guard.events = prior_events;
+        events_guard.next_index = next_index;
     }
 
     state.sessions.insert(session_id.clone(), active_session);
@@ -444,19 +450,30 @@ fn validate_stdio_command(command: &str) -> Result<(), AppError> {
         ));
     }
 
-    // Reject known shell binaries and common escape tools by basename.
+    // Allowlist: only permit known-safe MCP server executables.
+    // Operators can extend this list via the ALLOWED_STDIO_COMMANDS env var
+    // (comma-separated basenames or full paths).
+    let default_allowed = ["claude-agent-acp", "claude"];
+    let env_allowed = std::env::var("ALLOWED_STDIO_COMMANDS").unwrap_or_default();
+    let env_commands: Vec<&str> = env_allowed
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
     let command_basename = std::path::Path::new(command)
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(command);
-    let blocked_commands = [
-        "sh", "bash", "zsh", "fish", "csh", "tcsh", "dash", "ksh",
-        "python", "python2", "python3", "perl", "ruby", "node", "nodejs",
-        "nc", "netcat", "ncat", "socat",
-    ];
-    if blocked_commands.contains(&command_basename) {
+
+    let allowed = default_allowed.contains(&command_basename)
+        || env_commands.contains(&command_basename)
+        || env_commands.contains(&command);
+
+    if !allowed {
         return Err(AppError::InvalidRequest(format!(
-            "MCP stdio command '{}' is not permitted",
+            "MCP stdio command '{}' is not in the allowed list. \
+             Set ALLOWED_STDIO_COMMANDS env var to permit additional commands.",
             command_basename
         )));
     }
@@ -526,6 +543,8 @@ mod stdio_tests {
 
     #[test]
     fn test_validate_stdio_command_blocks_shells() {
+        // These are no longer in a blocklist but are not in the allowlist either,
+        // so they must still be rejected.
         assert!(validate_stdio_command("bash").is_err());
         assert!(validate_stdio_command("/bin/sh").is_err());
         assert!(validate_stdio_command("/usr/bin/python3").is_err());
@@ -540,10 +559,17 @@ mod stdio_tests {
     }
 
     #[test]
-    fn test_validate_stdio_command_permits_mcp_servers() {
-        assert!(validate_stdio_command("npx").is_ok());
-        assert!(validate_stdio_command("/usr/local/bin/my-mcp-server").is_ok());
-        assert!(validate_stdio_command("./mcp-server").is_ok());
+    fn test_validate_stdio_command_permits_allowlisted_commands() {
+        assert!(validate_stdio_command("claude-agent-acp").is_ok());
+        assert!(validate_stdio_command("claude").is_ok());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_rejects_formerly_permitted_commands() {
+        // npx and arbitrary paths are no longer allowed by default.
+        assert!(validate_stdio_command("npx").is_err());
+        assert!(validate_stdio_command("./mcp-server").is_err());
+        assert!(validate_stdio_command("/usr/local/bin/my-mcp-server").is_err());
     }
 
     #[test]
@@ -556,6 +582,28 @@ mod stdio_tests {
     fn test_validate_stdio_command_blocks_shell_substitution() {
         assert!(validate_stdio_command("${PATH}").is_err());
         assert!(validate_stdio_command("$(whoami)").is_err());
+    }
+
+    #[test]
+    fn test_validate_stdio_command_env_var_extends_allowlist() {
+        // Basename match via env var.
+        std::env::set_var("ALLOWED_STDIO_COMMANDS", "my-mcp-server,another-tool");
+        assert!(validate_stdio_command("my-mcp-server").is_ok());
+        assert!(validate_stdio_command("/usr/local/bin/my-mcp-server").is_ok());
+        assert!(validate_stdio_command("another-tool").is_ok());
+        // Commands not in env var are still rejected.
+        assert!(validate_stdio_command("npx").is_err());
+        std::env::remove_var("ALLOWED_STDIO_COMMANDS");
+    }
+
+    #[test]
+    fn test_validate_stdio_command_env_var_full_path_match() {
+        // Full path can also be specified directly in env var.
+        std::env::set_var("ALLOWED_STDIO_COMMANDS", "/opt/custom/mcp-server");
+        assert!(validate_stdio_command("/opt/custom/mcp-server").is_ok());
+        // A different path with the same basename is NOT allowed (only exact or basename).
+        assert!(validate_stdio_command("/other/mcp-server").is_err());
+        std::env::remove_var("ALLOWED_STDIO_COMMANDS");
     }
 
     // Bead .49 — arg validation tests
