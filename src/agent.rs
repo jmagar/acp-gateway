@@ -39,6 +39,10 @@ enum AgentCommand {
         prompt: Vec<ContentBlock>,
         resp: oneshot::Sender<Result<PromptResponse>>,
     },
+    Cancel {
+        session_id: SessionId,
+        resp: oneshot::Sender<Result<()>>,
+    },
     Close {
         resp: oneshot::Sender<Result<()>>,
     },
@@ -104,6 +108,15 @@ impl AgentHandle {
             vec![ContentBlock::Text(acp::TextContent::new(content))],
         )
         .await
+    }
+
+    pub async fn cancel(&self, session_id: SessionId) -> Result<()> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        self.command_tx
+            .send(AgentCommand::Cancel { session_id, resp: resp_tx })
+            .await
+            .map_err(|_| anyhow!("agent worker is no longer running"))?;
+        resp_rx.await.context("agent worker dropped cancel response")?
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -240,6 +253,13 @@ pub async fn connect_agent(def: &AgentDef) -> Result<AgentHandle> {
                     } => {
                         let result = connection
                             .prompt(acp::PromptRequest::new(session_id, prompt))
+                            .await
+                            .map_err(anyhow::Error::from);
+                        let _ = resp.send(result);
+                    }
+                    AgentCommand::Cancel { session_id, resp } => {
+                        let result = connection
+                            .cancel(acp::CancelNotification::new(session_id))
                             .await
                             .map_err(anyhow::Error::from);
                         let _ = resp.send(result);

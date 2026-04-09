@@ -255,6 +255,30 @@ pub async fn resume(
     })))
 }
 
+pub async fn cancel_session(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, AppError> {
+    if !state.sessions.contains(&session_id) {
+        if state.sessions.registry.get_async(&session_id).await.is_some() {
+            return Err(AppError::SessionDead(session_id));
+        }
+        return Err(AppError::SessionNotFound(session_id));
+    }
+
+    let handle = state
+        .sessions
+        .agent_handle(&session_id)
+        .ok_or_else(|| AppError::SessionDead(session_id.clone()))?;
+
+    handle
+        .cancel(SessionId::new(session_id))
+        .await
+        .map_err(AppError::Acp)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_agents() -> Json<serde_json::Value> {
     let mut agents: Vec<_> = known_agents()
         .values()

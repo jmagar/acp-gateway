@@ -53,6 +53,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/sessions/{id}/events", get(handlers::sessions::events))
         .route("/api/sessions/{id}/stream", get(handlers::stream::stream))
         .route("/api/sessions/{id}/resume", post(handlers::sessions::resume))
+        .route("/api/sessions/{id}/cancel", post(handlers::sessions::cancel_session))
         .route("/api/agents", get(handlers::sessions::list_agents))
         .route("/v1/models", get(handlers::openai::models))
         .route("/v1/chat/completions", post(handlers::openai::chat_completions))
