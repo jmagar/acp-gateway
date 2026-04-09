@@ -199,4 +199,6 @@ impl SessionManager {
 pub struct AppState {
     pub sessions: Arc<SessionManager>,
     pub pools: Arc<HashMap<String, AgentPool>>,
+    /// Validated, canonicalized working directory for OpenAI chat completions (bead .52).
+    pub default_cwd: PathBuf,
 }

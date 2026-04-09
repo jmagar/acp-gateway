@@ -20,7 +20,7 @@ use axum::{
 };
 use chrono::Utc;
 use serde_json::json;
-use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, convert::Infallible, sync::Arc};
 use uuid::Uuid;
 
 pub async fn models() -> Json<serde_json::Value> {
@@ -59,7 +59,7 @@ pub async fn chat_completions(
     let handle = pool.acquire().await.map_err(AppError::Acp)?;
 
     let session = handle
-        .new_session(default_cwd(), vec![])
+        .new_session(state.default_cwd.clone(), vec![])
         .await
         .map_err(AppError::Acp)?;
     let request_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
@@ -283,8 +283,3 @@ async fn streaming_response(
     Ok(Sse::new(stream).into_response())
 }
 
-fn default_cwd() -> PathBuf {
-    std::env::var("DEFAULT_CWD")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
-}
