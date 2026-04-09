@@ -38,12 +38,10 @@ pub async fn create(
     let agent_def = get_agent(&body.agent)
         .ok_or_else(|| AppError::AgentNotFound(body.agent.clone()))?;
     let handle = connect_agent(&agent_def).await.map_err(AppError::Acp)?;
-    let mcp_servers = body
-        .mcp_servers
-        .iter()
-        .enumerate()
-        .map(|(index, config)| mcp_to_acp(config, index))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut mcp_servers = Vec::new();
+    for (index, config) in body.mcp_servers.iter().enumerate() {
+        mcp_servers.push(mcp_to_acp(config, index).await?);
+    }
 
     let cwd = validate_cwd(&body.cwd)?;
     let response = handle
@@ -203,12 +201,10 @@ pub async fn resume(
     let agent_def = get_agent(&meta.agent)
         .ok_or_else(|| AppError::AgentNotFound(meta.agent.clone()))?;
     let handle = connect_agent(&agent_def).await.map_err(AppError::Acp)?;
-    let mcp_servers = meta
-        .mcp_servers
-        .iter()
-        .enumerate()
-        .map(|(index, config)| mcp_to_acp(config, index))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut mcp_servers = Vec::new();
+    for (index, config) in meta.mcp_servers.iter().enumerate() {
+        mcp_servers.push(mcp_to_acp(config, index).await?);
+    }
 
     resume_session(&handle, &session_id, &meta.cwd, mcp_servers)
         .await
@@ -333,7 +329,8 @@ fn validate_cwd(cwd: &str) -> Result<std::path::PathBuf, AppError> {
 }
 
 /// Bead .50 — robust SSRF validation using the `url` crate.
-fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
+/// Bead .106 — async DNS resolution to prevent DNS rebinding attacks.
+async fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
     let url = url::Url::parse(url_str).map_err(|_| {
         AppError::InvalidRequest(format!("MCP server URL is not valid: {url_str}"))
     })?;
@@ -359,6 +356,22 @@ fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
                     "MCP server URL targets a local/internal hostname: {url_str}"
                 )));
             }
+            // Resolve hostname to catch DNS rebinding attacks (bead .106)
+            let port = url.port_or_known_default().unwrap_or(80);
+            let addrs = tokio::net::lookup_host(format!("{domain}:{port}"))
+                .await
+                .map_err(|_| {
+                    AppError::InvalidRequest(format!(
+                        "MCP server URL host '{domain}' could not be resolved"
+                    ))
+                })?;
+            for addr in addrs {
+                if is_private_ip_addr(addr.ip()) {
+                    return Err(AppError::InvalidRequest(format!(
+                        "MCP server URL host '{domain}' resolves to a private IP address"
+                    )));
+                }
+            }
         }
         url::Host::Ipv4(addr) => {
             if is_private_ipv4(addr) {
@@ -377,6 +390,13 @@ fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
     }
 
     Ok(())
+}
+
+fn is_private_ip_addr(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => is_private_ipv4(&v4),
+        std::net::IpAddr::V6(v6) => is_private_ipv6(&v6),
+    }
 }
 
 fn is_private_ipv4(addr: &std::net::Ipv4Addr) -> bool {
@@ -507,17 +527,17 @@ fn validate_stdio_arg(arg: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppError> {
+async fn mcp_to_acp(config: &McpServerConfig, index: usize) -> Result<McpServer, AppError> {
     match config {
         McpServerConfig::Sse { url } => {
-            validate_mcp_url(url)?;
+            validate_mcp_url(url).await?;
             Ok(McpServer::Sse(McpServerSse::new(
                 format!("mcp-sse-{index}"),
                 url.clone(),
             )))
         }
         McpServerConfig::Http { url } => {
-            validate_mcp_url(url)?;
+            validate_mcp_url(url).await?;
             Ok(McpServer::Http(McpServerHttp::new(
                 format!("mcp-http-{index}"),
                 url.clone(),
@@ -666,52 +686,60 @@ mod cwd_tests {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_validate_mcp_url_blocks_private_ips() {
-        // RFC-1918 and loopback addresses must be rejected.
-        assert!(validate_mcp_url("http://10.0.0.1/api").is_err());
-        assert!(validate_mcp_url("http://192.168.1.1/api").is_err());
-        assert!(validate_mcp_url("http://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_mcp_url("http://127.0.0.1:8080/api").is_err());
-        // Sensitive hostnames must be rejected.
-        assert!(validate_mcp_url("http://localhost/api").is_err());
-        assert!(validate_mcp_url("http://myservice.local/api").is_err());
+    // NOTE: Domain-based DNS rebinding tests (bead .106) are integration tests only,
+    // because tokio::net::lookup_host requires network access and a real async runtime
+    // with DNS resolution. The IP-literal tests below cover the static checks exhaustively.
+
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_private_ips() {
+        // RFC-1918 and loopback addresses must be rejected (IP literals — no DNS needed).
+        assert!(validate_mcp_url("http://10.0.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://192.168.1.1/api").await.is_err());
+        assert!(
+            validate_mcp_url("http://169.254.169.254/latest/meta-data/")
+                .await
+                .is_err()
+        );
+        assert!(validate_mcp_url("http://127.0.0.1:8080/api").await.is_err());
+        // Sensitive hostnames must be rejected (static check, no DNS).
+        assert!(validate_mcp_url("http://localhost/api").await.is_err());
+        assert!(validate_mcp_url("http://myservice.local/api").await.is_err());
         // Non-http schemes must be rejected.
-        assert!(validate_mcp_url("ftp://example.com/").is_err());
-        assert!(validate_mcp_url("file:///etc/passwd").is_err());
-        // Public addresses must be accepted.
-        assert!(validate_mcp_url("https://example.com/api").is_ok());
-        assert!(validate_mcp_url("http://example.com:3000/api").is_ok());
-        assert!(validate_mcp_url("https://api.example.com/v1/mcp").is_ok());
+        assert!(validate_mcp_url("ftp://example.com/").await.is_err());
+        assert!(validate_mcp_url("file:///etc/passwd").await.is_err());
     }
 
-    #[test]
-    fn test_validate_mcp_url_blocks_172_16_range() {
-        // All 172.16.x.x–172.31.x.x must be blocked.
-        assert!(validate_mcp_url("http://172.16.0.1/api").is_err());
-        assert!(validate_mcp_url("http://172.31.255.255/api").is_err());
-        // 172.15.x.x and 172.32.x.x are public and must be allowed.
-        assert!(validate_mcp_url("http://172.15.0.1/api").is_ok());
-        assert!(validate_mcp_url("http://172.32.0.1/api").is_ok());
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_172_16_range() {
+        // All 172.16.x.x–172.31.x.x must be blocked (IP literals).
+        assert!(validate_mcp_url("http://172.16.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://172.31.255.255/api").await.is_err());
+        // 172.15.x.x and 172.32.x.x are public — these are IP literals so no DNS.
+        assert!(validate_mcp_url("http://172.15.0.1/api").await.is_ok());
+        assert!(validate_mcp_url("http://172.32.0.1/api").await.is_ok());
     }
 
     // Bead .50 — IPv6 bypass tests
-    #[test]
-    fn test_validate_mcp_url_blocks_ipv6_loopback() {
-        assert!(validate_mcp_url("http://[::1]:8080/").is_err());
-        assert!(validate_mcp_url("http://[::1]/api").is_err());
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_ipv6_loopback() {
+        assert!(validate_mcp_url("http://[::1]:8080/").await.is_err());
+        assert!(validate_mcp_url("http://[::1]/api").await.is_err());
     }
 
-    #[test]
-    fn test_validate_mcp_url_blocks_ipv6_mapped_ipv4() {
-        assert!(validate_mcp_url("http://[::ffff:127.0.0.1]/").is_err());
-        assert!(validate_mcp_url("http://[::ffff:192.168.1.1]/").is_err());
-        assert!(validate_mcp_url("http://[::ffff:10.0.0.1]/").is_err());
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_ipv6_mapped_ipv4() {
+        assert!(validate_mcp_url("http://[::ffff:127.0.0.1]/").await.is_err());
+        assert!(
+            validate_mcp_url("http://[::ffff:192.168.1.1]/")
+                .await
+                .is_err()
+        );
+        assert!(validate_mcp_url("http://[::ffff:10.0.0.1]/").await.is_err());
     }
 
-    #[test]
-    fn test_validate_mcp_url_blocks_ipv6_link_local_and_ula() {
-        assert!(validate_mcp_url("http://[fe80::1]/").is_err());
-        assert!(validate_mcp_url("http://[fc00::1]/").is_err());
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_ipv6_link_local_and_ula() {
+        assert!(validate_mcp_url("http://[fe80::1]/").await.is_err());
+        assert!(validate_mcp_url("http://[fc00::1]/").await.is_err());
     }
 }
