@@ -52,6 +52,7 @@ pub fn event_type_for_update(update: &SessionUpdate) -> Option<&'static str> {
         SessionUpdate::AvailableCommandsUpdate(_) => Some("available_commands_update"),
         SessionUpdate::CurrentModeUpdate(_) => Some("current_mode_update"),
         SessionUpdate::ConfigOptionUpdate(_) => Some("config_option_update"),
+        SessionUpdate::SessionInfoUpdate(_) => Some("session_info_update"),
         _ => None,
     }
 }
