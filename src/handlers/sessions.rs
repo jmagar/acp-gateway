@@ -329,7 +329,16 @@ fn validate_cwd(cwd: &str) -> Result<std::path::PathBuf, AppError> {
 }
 
 /// Bead .50 — robust SSRF validation using the `url` crate.
-/// Bead .106 — async DNS resolution to prevent DNS rebinding attacks.
+/// Bead .106 — async DNS resolution performed at request-validation time.
+///
+/// IMPORTANT (residual gap): this resolves and checks the hostname *now*, but
+/// the resolved address is discarded — it is not pinned for the connection
+/// that actually happens later. The agent subprocess re-resolves the same
+/// hostname on its own when it connects to the MCP server. If the DNS record
+/// changes between this check and that later connection (a classic
+/// TOCTOU/DNS-rebinding window), the subprocess can end up connecting to a
+/// private/internal address that this function never saw. See SECURITY.md
+/// for the residual risk and recommended mitigations.
 async fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
     let url = url::Url::parse(url_str).map_err(|_| {
         AppError::InvalidRequest(format!("MCP server URL is not valid: {url_str}"))
@@ -356,7 +365,9 @@ async fn validate_mcp_url(url_str: &str) -> Result<(), AppError> {
                     "MCP server URL targets a local/internal hostname: {url_str}"
                 )));
             }
-            // Resolve hostname to catch DNS rebinding attacks (bead .106)
+            // Resolve hostname at request-validation time (bead .106). This is a
+            // point-in-time check only — see the function doc comment and
+            // SECURITY.md for the residual DNS-rebinding/TOCTOU gap.
             let port = url.port_or_known_default().unwrap_or(80);
             let addrs = tokio::net::lookup_host(format!("{domain}:{port}"))
                 .await
@@ -413,6 +424,18 @@ fn is_private_ipv4(addr: &std::net::Ipv4Addr) -> bool {
     || (o[0] == 192 && o[1] == 168)
     // 169.254.0.0/16  — link-local / AWS & Azure IMDS
     || (o[0] == 169 && o[1] == 254)
+    // 100.64.0.0/10  — CGNAT / Tailscale / carrier-grade NAT
+    || (o[0] == 100 && (64..=127).contains(&o[1]))
+    // 192.0.0.0/24  — IETF protocol assignments
+    || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+    // 192.0.2.0/24  — TEST-NET-1 documentation range
+    || (o[0] == 192 && o[1] == 0 && o[2] == 2)
+    // 198.18.0.0/15  — benchmarking
+    || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+    // 224.0.0.0/4  — multicast
+    || (224..=239).contains(&o[0])
+    // 240.0.0.0/4  — reserved (includes 255.255.255.255 broadcast)
+    || o[0] >= 240
 }
 
 fn is_private_ipv6(addr: &std::net::Ipv6Addr) -> bool {
@@ -741,5 +764,34 @@ mod tests {
     async fn test_validate_mcp_url_blocks_ipv6_link_local_and_ula() {
         assert!(validate_mcp_url("http://[fe80::1]/").await.is_err());
         assert!(validate_mcp_url("http://[fc00::1]/").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_cgnat_tailscale_range() {
+        // 100.64.0.0/10 — CGNAT / Tailscale (IP literals — no DNS needed).
+        assert!(validate_mcp_url("http://100.64.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://100.100.100.100/api").await.is_err());
+        assert!(validate_mcp_url("http://100.127.255.255/api").await.is_err());
+        // Just outside the range must remain allowed.
+        assert!(validate_mcp_url("http://100.63.255.255/api").await.is_ok());
+        assert!(validate_mcp_url("http://100.128.0.0/api").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_mcp_url_blocks_reserved_and_special_ranges() {
+        // 192.0.0.0/24 — IETF protocol assignments.
+        assert!(validate_mcp_url("http://192.0.0.1/api").await.is_err());
+        // 192.0.2.0/24 — TEST-NET-1 documentation range.
+        assert!(validate_mcp_url("http://192.0.2.1/api").await.is_err());
+        // 198.18.0.0/15 — benchmarking.
+        assert!(validate_mcp_url("http://198.18.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://198.19.255.255/api").await.is_err());
+        assert!(validate_mcp_url("http://198.20.0.1/api").await.is_ok());
+        // 224.0.0.0/4 — multicast.
+        assert!(validate_mcp_url("http://224.0.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://239.255.255.255/api").await.is_err());
+        // 240.0.0.0/4 — reserved, including broadcast.
+        assert!(validate_mcp_url("http://240.0.0.1/api").await.is_err());
+        assert!(validate_mcp_url("http://255.255.255.255/api").await.is_err());
     }
 }
