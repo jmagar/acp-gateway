@@ -15,3 +15,8 @@ claude-agent-acp
 .dolt/
 *.db
 .beads-credential-key
+.beads
+.omc
+.lavra
+.full-review
+.claude/worktrees/
